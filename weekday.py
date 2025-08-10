@@ -387,6 +387,23 @@ class Summariser:
         except Exception:
             return ""
 
+    async def page_type(self, text: str, url: str) -> str:
+        prompt = (
+            "Classify the webpage into one of: 'ministry', 'listing', 'career', "
+            "'donation', or 'other'. A ministry page describes a single "
+            "ministry or program. A listing page mainly links to multiple "
+            "ministries. Return only the label.\n"
+            f"URL: {url}\nText:\n" + (text or "")[:2000]
+        )
+        try:
+            resp = await self.llm.ainvoke([HumanMessage(content=prompt)])
+            label = (resp.content or "").strip().lower()
+            if label not in {"ministry", "listing", "career", "donation"}:
+                return "other"
+            return label
+        except Exception:
+            return "other"
+
     async def resolve_org_and_title(
         self,
         page_text: str,
@@ -461,20 +478,30 @@ async def search_ministries(county: str, state_abbrev: str, limit: int) -> list[
 class Browser:
     def __init__(self):
         self.ws_url = os.getenv("PLAYWRIGHT_MCP_URL")
-        self._task: asyncio.Task | None = asyncio.create_task(self._open())
         self._toolkit: PlayWrightBrowserToolkit | None = None
+        self._playwright = None
+        self._browser = None
+        self._task: asyncio.Task | None = asyncio.create_task(self._open())
 
     async def _open(self):
-        pw = await async_playwright().start()
+        self._playwright = await async_playwright().start()
         if self.ws_url:
-            return await pw.chromium.connect(self.ws_url)
-        return await pw.chromium.launch(headless=True)
+            self._browser = await self._playwright.chromium.connect(self.ws_url)
+        else:
+            self._browser = await self._playwright.chromium.launch(headless=True)
+        return self._browser
 
     async def toolkit(self) -> PlayWrightBrowserToolkit:
         if self._toolkit is None:
             browser = await self._task
             self._toolkit = PlayWrightBrowserToolkit.from_browser(async_browser=browser)
         return self._toolkit
+
+    async def close(self):
+        if self._browser:
+            await self._browser.close()
+        if self._playwright:
+            await self._playwright.stop()
 
 # ---------- Ministry extraction --------------------------------------------------------------
 MINISTRY_WORDS = ("ministry", "ministries", "program", "group", "recovery", "care", "support", "outreach")
@@ -537,6 +564,10 @@ class MinistryScraper:
             if not page_text.strip():
                 return []
 
+            page_kind = await self.summariser.page_type(page_text, url)
+            if page_kind in {"career", "donation", "other"}:
+                return []
+
             soup = BeautifulSoup(page_html or "", "html.parser")
             home_url = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
             host = (urlparse(url).hostname or "").lower()
@@ -577,17 +608,21 @@ class MinistryScraper:
                 else:
                     org_name = org_name_guess if org_name_guess and org_name_guess.lower() not in AGGREGATOR_NAMES else (page_title or result_title or org_name)
 
-            # Detect index of ministries; explode to individual entries
-            sublinks = extract_ministry_links(soup, url)
-            is_index_like = ("/ministr" in (urlparse(url).path.lower())) or (len(sublinks) >= 3)
+            # Use AI to detect ministry listing pages and expand them
+            sublinks = extract_ministry_links(soup, url) if page_kind == "listing" else []
+            if page_kind == "listing" and not sublinks:
+                return []
 
             records: list[MinistryRecord] = []
-            if is_index_like and sublinks:
+            if page_kind == "listing" and sublinks:
                 for link_title, link_url in sublinks[:30]:  # cap fan-out per page
                     html2 = await fetch_html(link_url)
                     if not html2:
                         continue
                     text2 = visible_text(html2)
+                    kind2 = await self.summariser.page_type(text2, link_url)
+                    if kind2 != "ministry":
+                        continue
                     soup2 = BeautifulSoup(html2, "html.parser")
 
                     # Page-specific guesses
@@ -621,6 +656,8 @@ class MinistryScraper:
                         fixed2 = _clean_name_from_titles(page_title2, link_title)
                         if fixed2:
                             org2 = fixed2
+                        else:
+                            org2 = org_name
 
                     summary2 = await self.summariser.summary(text2)
                     cats2 = await self.classifier.classify(summary2 or text2[:600])
@@ -720,6 +757,7 @@ class MinistryScraper:
                 self._write_record(rec)
 
     async def close(self):
+        await self.browser.close()
         if _async_session and not _async_session.closed:
             await _async_session.close()
 
