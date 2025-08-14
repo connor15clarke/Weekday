@@ -33,13 +33,82 @@ import usaddress
 from bs4 import BeautifulSoup
 from ddgs import DDGS
 from dotenv import load_dotenv
+import time
+from langchain.callbacks.base import AsyncCallbackHandler
 from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 from playwright.async_api import async_playwright
 from langchain_community.agent_toolkits.playwright import PlayWrightBrowserToolkit
+from langchain.agents import AgentExecutor, create_openai_functions_agent
 
 load_dotenv()
+
+# ---------- OpenAI API usage tracking -------------------------------------------------------
+OPENAI_MAX_RPM = int(os.getenv("OPENAI_MAX_RPM", "0")) or None
+OPENAI_MAX_TPM = int(os.getenv("OPENAI_MAX_TPM", "0")) or None
+
+
+class OpenAIUsageTracker:
+    def __init__(self, max_rpm: int | None, max_tpm: int | None):
+        self.max_rpm = max_rpm
+        self.max_tpm = max_tpm
+        self._lock = asyncio.Lock()
+        self._reset()
+
+    def _reset(self) -> None:
+        self._start = time.monotonic()
+        self._requests = 0
+        self._tokens = 0
+
+    async def _maybe_sleep(self, now: float) -> None:
+        elapsed = now - self._start
+        if (
+            (self.max_rpm and self._requests >= self.max_rpm)
+            or (self.max_tpm and self._tokens >= self.max_tpm)
+        ):
+            wait = 60 - elapsed
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._reset()
+
+    async def before(self) -> None:
+        async with self._lock:
+            now = time.monotonic()
+            if now - self._start >= 60:
+                self._reset()
+            await self._maybe_sleep(now)
+
+    async def after(self, tokens: int) -> None:
+        async with self._lock:
+            now = time.monotonic()
+            if now - self._start >= 60:
+                self._reset()
+            self._requests += 1
+            self._tokens += tokens
+            await self._maybe_sleep(now)
+
+
+OPENAI_USAGE = OpenAIUsageTracker(OPENAI_MAX_RPM, OPENAI_MAX_TPM)
+
+
+class UsageCallbackHandler(AsyncCallbackHandler):
+    def __init__(self, tracker: OpenAIUsageTracker):
+        self.tracker = tracker
+
+    async def on_llm_start(self, *args, **kwargs):  # type: ignore[override]
+        await self.tracker.before()
+
+    async def on_llm_end(self, response, **kwargs):  # type: ignore[override]
+        usage = getattr(response, "llm_output", {}) or {}
+        usage = usage.get("token_usage", {})
+        total = usage.get("total_tokens") or (
+            usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
+        )
+        await self.tracker.after(int(total or 0))
+
+
+USAGE_HANDLER = UsageCallbackHandler(OPENAI_USAGE)
 
 # ---------- Files & constants ---------------------------------------------------------------
 OUTPUT_DIR = Path("out"); OUTPUT_DIR.mkdir(exist_ok=True)
@@ -439,7 +508,12 @@ _ADDRESS_LLM: ChatOpenAI | None = None
 def _address_llm() -> ChatOpenAI:
     global _ADDRESS_LLM
     if _ADDRESS_LLM is None:
-        _ADDRESS_LLM = ChatOpenAI(model="gpt-4o-mini", temperature=0.0, openai_api_key=os.getenv("OPENAI_API_KEY"))
+        _ADDRESS_LLM = ChatOpenAI(
+            model="gpt-4o-mini",
+            temperature=0.0,
+            openai_api_key=os.getenv("OPENAI_API_KEY"),
+            callbacks=[USAGE_HANDLER],
+        )
     return _ADDRESS_LLM
 
 async def _ai_choose_best_address(candidates: list[dict], page_text: str, state_hint: str | None) -> dict | None:
@@ -661,6 +735,98 @@ async def enrich_address_via_duckduckgo(org_name: str, home_url: str, state_hint
     return ranked[0]
 
 
+async def search_google_maps_address(ministry_name: str, county: str, state_abbrev: str) -> dict:
+    """Search Google Maps (via DDG) for a ministry's address.
+
+    Uses query pattern "(Ministry) (county) (state abbreviation) address" and
+    extracts structured components from Google Maps URLs or general snippets.
+
+    Returns a dict with keys ``address``, ``city``, ``state``, ``zip`` or an empty
+    dict when no match is found.
+    """
+    if not ministry_name or not isinstance(ministry_name, str):
+        print("Warning: Invalid ministry name for address search")
+        return {}
+
+    clean_name = ministry_name.strip()
+    if len(clean_name) > 100:
+        clean_name = clean_name[:100].rsplit(" ", 1)[0]
+
+    query = f'"{clean_name}" {county} County {state_abbrev} address'
+
+    try:
+        with DDGS() as ddgs:
+            maps_query = (
+                f'site:google.com/maps OR site:maps.google.com "{clean_name}" '
+                f'{county} County {state_abbrev}'
+            )
+            results = ddgs.text(maps_query, max_results=3)
+            for result in results:
+                url = result.get("href", "")
+                if "google.com/maps" in url or "maps.google.com" in url:
+                    parsed = urlparse(url)
+                    params = parse_qs(parsed.query)
+                    address_text = None
+                    if "q" in params:
+                        address_text = unquote_plus(params["q"][0])
+                    elif "daddr" in params:
+                        address_text = unquote_plus(params["daddr"][0])
+                    elif "destination" in params:
+                        address_text = unquote_plus(params["destination"][0])
+                    if address_text:
+                        pattern = (
+                            r"(\d+\s+[^,]+),\s*([^,]+),\s*([A-Z]{2})\s+(\d{5}(?:-\d{4})?)"
+                        )
+                        match = re.search(pattern, address_text)
+                        if match:
+                            return {
+                                "address": match.group(1).strip(),
+                                "city": match.group(2).strip(),
+                                "state": match.group(3),
+                                "zip": match.group(4),
+                            }
+
+            general_results = ddgs.text(query, max_results=5)
+            for result in general_results:
+                snippet = result.get("body", "")
+                pattern = (
+                    r"(\d+\s+[^,]+),\s*([^,]+),\s*([A-Z]{2})\s+(\d{5}(?:-\d{4})?)"
+                )
+                match = re.search(pattern, snippet)
+                if match:
+                    street = match.group(1).strip()
+                    if re.match(r'^\d+\s+', street) and len(street) < 100:
+                        return {
+                            "address": street,
+                            "city": match.group(2).strip(),
+                            "state": match.group(3),
+                            "zip": match.group(4),
+                        }
+
+                city_state_zip = r"([A-Za-z\s]+),\s*([A-Z]{2})\s+(\d{5}(?:-\d{4})?)"
+                match2 = re.search(city_state_zip, snippet)
+                if match2:
+                    street_pattern = (
+                        r"(\d+\s+[A-Za-z0-9\s]+(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|"
+                        r"Drive|Dr|Lane|Ln|Way|Court|Ct|Place|Pl|Circle|Cir|Parkway|Pkwy))"
+                    )
+                    street_match = re.search(
+                        street_pattern, snippet[: match2.start()], re.I
+                    )
+                    if street_match:
+                        return {
+                            "address": street_match.group(1).strip(),
+                            "city": match2.group(1).strip(),
+                            "state": match2.group(2),
+                            "zip": match2.group(3),
+                        }
+
+    except Exception as e:
+        print(f"Error searching Google Maps for '{clean_name}': {str(e)[:200]}")
+
+    return {}
+
+
 # ---------- Category classifier & summariser -------------------------------------------------
 class CategoryClassifier:
     """Maps description → one or more categories from categories.csv.
@@ -695,7 +861,12 @@ class CategoryClassifier:
                         self._slash_alias[p] = c
 
         api_key = os.getenv("OPENAI_API_KEY")
-        self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0, openai_api_key=api_key)
+        self.llm = ChatOpenAI(
+            model="gpt-4o-mini",
+            temperature=0.0,
+            openai_api_key=api_key,
+            callbacks=[USAGE_HANDLER],
+        )
 
     async def classify(self, description: str) -> list[str]:
         allowed = ", ".join(self.categories)
@@ -738,7 +909,12 @@ class CategoryClassifier:
 class Summariser:
     def __init__(self):
         api_key = os.getenv("OPENAI_API_KEY")
-        self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.3, openai_api_key=api_key)
+        self.llm = ChatOpenAI(
+            model="gpt-4o-mini",
+            temperature=0.3,
+            openai_api_key=api_key,
+            callbacks=[USAGE_HANDLER],
+        )
 
     async def summary(self, text: str) -> str:
         prompt = (
@@ -839,6 +1015,39 @@ class Browser:
             browser = await self._task
             self._toolkit = PlayWrightBrowserToolkit.from_browser(async_browser=browser)
         return self._toolkit
+
+
+async def agentic_address_search(url: str, state_hint: str | None, browser: Browser) -> dict:
+    """
+    Use an LLM with Playwright tools to locate a ministry's mailing address.
+    Returns {address, city, state, zip} or {}.
+    """
+    try:
+        tk = await browser.toolkit()
+        tools = tk.get_tools()
+        llm = ChatOpenAI(
+            model="gpt-4o-mini",
+            temperature=0.0,
+            openai_api_key=os.getenv("OPENAI_API_KEY"),
+            callbacks=[USAGE_HANDLER],
+        )
+        agent = create_openai_functions_agent(llm, tools)
+        executor = AgentExecutor(agent=agent, tools=tools, verbose=False)
+        prompt = (
+            f"Navigate to {url} and find the ministry's physical mailing address. "
+            f"State hint: {state_hint or ''}. "
+            "Return JSON ONLY with keys: address, city, state, zip. "
+            "If not found, return an empty JSON object."
+        )
+        res = await executor.ainvoke({"input": prompt})
+        data = json.loads((res.get("output") or "").strip())
+        if isinstance(data, dict):
+            out = _mk_addr(data.get("address"), data.get("city"), data.get("state"), data.get("zip"))
+            if _is_good(out):
+                return out
+    except Exception:
+        pass
+    return {}
 
 # ---------- Ministry extraction --------------------------------------------------------------
 MINISTRY_WORDS = ("ministry", "ministries", "program", "group", "recovery", "care", "support", "outreach")
@@ -988,7 +1197,11 @@ class MinistryScraper:
 
                     summary2 = await self.summariser.summary(text2)
                     cats2 = await self.classifier.classify(summary2 or text2[:600])
-                    addr2 = await extract_address_fields(html2, text2, state_abbrev)
+                    addr2 = await agentic_address_search(link_url, state_abbrev, self.browser)
+                    if not (addr2.get("city") and addr2.get("state")):
+                        addr2 = await search_google_maps_address(org2, county, state_abbrev)
+                    if not (addr2.get("city") and addr2.get("state")):
+                        addr2 = await extract_address_fields(html2, text2, state_abbrev)
                     if not (addr2.get("city") and addr2.get("state")):
                         addr2 = await enrich_address_via_duckduckgo(org2, home_url, state_abbrev)
                     phone2 = PHONE_REGEX.search(text2)
@@ -1015,7 +1228,11 @@ class MinistryScraper:
             # Single-ministry page
             summary = await self.summariser.summary(page_text)
             cats = await self.classifier.classify(summary or page_text[:600])
-            addr = await extract_address_fields(page_html or "", page_text, state_abbrev)
+            addr = await agentic_address_search(url, state_abbrev, self.browser)
+            if not (addr.get("city") and addr.get("state")):
+                addr = await search_google_maps_address(org_name, county, state_abbrev)
+            if not (addr.get("city") and addr.get("state")):
+                addr = await extract_address_fields(page_html or "", page_text, state_abbrev)
             if not (addr.get("city") and addr.get("state")):
                 addr = await enrich_address_via_duckduckgo(org_name, home_url, state_abbrev)
             phone = PHONE_REGEX.search(page_text)
