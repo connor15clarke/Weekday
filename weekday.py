@@ -24,7 +24,7 @@ import os
 import re
 from pathlib import Path
 from typing import AsyncIterator
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, parse_qs, unquote_plus
 
 import aiohttp
 import pandas as pd
@@ -107,11 +107,11 @@ AGGREGATOR_DOMAINS = {
     "instagram.com", "twitter.com", "x.com", "linkedin.com", "goo.gl", "google.com", "g.page",
     "bing.com", "duckduckgo.com", "eventbrite.com", "meetup.com", "constantcontact.com",
     "blackbaudhosting.com", "donorbox.org", "pushpay.com", "paypal.com", "square.site", "my.canva.site",
-    "linktr.ee", "linktree.com"
+    "linktr.ee", "linktree.com", "wikipedia.org", "wikipedia.com"
 }
 AGGREGATOR_NAMES = {
     "mapquest","facebook","yelp","google","bing","duckduckgo","eventbrite","meetup",
-    "paypal","pushpay","donorbox","square","linktree","instagram","twitter","x","linkedin"
+    "paypal","pushpay","donorbox","square","linktree","instagram","twitter","x","linkedin", "wikipedia"
 }
 
 def _clean_name_from_titles(page_title: str | None, result_title: str | None) -> str | None:
@@ -247,55 +247,419 @@ def extract_ministry_title(soup: BeautifulSoup, url: str, org_name: str, result_
     # Final fallback
     return org_name
 
+# ---------- Address extraction (AI-boosted v2) ----------------------------------------------
 
-def _addr_from_json_ld(soup: BeautifulSoup):
+ADDRESS_BLOCK_RE = re.compile(r"(?:^|[\n\r])\s*(?:address|visit (?:us|our)|location|contact)\b[:\s]*", re.I)
+
+STREET_PATTERN = r"""
+(?P<street>
+  (?:
+    \d{1,6}\s+[A-Za-z0-9.\-']+(?:\s+[A-Za-z0-9.\-']+)*
+    \s+(?:Ave(?:nue)?|St(?:reet)?|Rd(?:oad)?|Blvd|Boulevard|Ln|Lane|Dr|Drive|Ct|Court|Hwy|Highway|Way|Pkwy|Parkway|Pl|Place|Terrace|Ter|Cir|Circle)
+    (?:\s+(?:N|S|E|W|NE|NW|SE|SW))?
+    (?:\s*(?:Unit|Ste\.?|Suite|\#)\s*[A-Za-z0-9\-]+)?
+  )
+)
+"""
+CITY_STATE_ZIP_PATTERN = r"(?P<city>[A-Za-z .'\-]+)\s*,\s*(?P<state>[A-Z]{2})\s+(?P<zip>\d{5}(?:-\d{4})?)"
+
+STREET_CITYZIP_RE = re.compile(rf"{STREET_PATTERN}\s*,\s*{CITY_STATE_ZIP_PATTERN}", re.I | re.X)
+POBOX_CITYZIP_RE = re.compile(r"""
+(?P<street>P(?:\.|\s*)O(?:\.|\s*)\s*Box\s+\d{1,8})\s*,?\s*
+(?P<city>[A-Za-z .'\-]+)\s*,\s*
+(?P<state>[A-Z]{2})\s+
+(?P<zip>\d{5}(?:-\d{4})?)
+""", re.I | re.X)
+
+def _iter_address_matches(text: str):
+    for m in STREET_CITYZIP_RE.finditer(text):
+        yield m.groupdict()
+    for m in POBOX_CITYZIP_RE.finditer(text):
+        yield m.groupdict()
+
+def _us_norm(state: str | None) -> str | None:
+    if not state: return None
+    st = us.states.lookup(state.strip())
+    return st.abbr if st else None
+
+def _mk_addr(street, city, state, zip_):
+    return {
+        "address": (street or "").strip() or None,
+        "city": (city or "").strip() or None,
+        "state": _us_norm(state),
+        "zip": (zip_ or "").strip() or None,
+    }
+
+def _is_good(c: dict) -> bool:
+    # good enough if at least city+state; better if full
+    return bool(c.get("city") and c.get("state"))
+
+def _find_postal_dicts(obj) -> list[dict]:
+    out = []
+    if isinstance(obj, dict):
+        if obj.get("@type") in ("PostalAddress","schema:PostalAddress") or \
+           {"streetAddress","addressLocality","addressRegion","postalCode"} & set(obj.keys()):
+            out.append(obj)
+        for v in obj.values():
+            out.extend(_find_postal_dicts(v))
+    elif isinstance(obj, list):
+        for it in obj:
+            out.extend(_find_postal_dicts(it))
+    return out
+
+def _candidates_from_jsonld(soup: BeautifulSoup) -> list[dict]:
+    cands = []
     for tag in soup.find_all("script", type="application/ld+json"):
         try:
             data = json.loads(tag.string or "")
         except Exception:
             continue
-        obj = data if isinstance(data, dict) else (data[0] if isinstance(data, list) and data else None)
-        if isinstance(obj, dict) and isinstance(obj.get("address"), dict):
-            a = obj["address"]
-            return {
-                "address": a.get("streetAddress"),
-                "city": a.get("addressLocality"),
-                "state": a.get("addressRegion"),
-                "zip": a.get("postalCode"),
-            }
+        for a in _find_postal_dicts(data):
+            cands.append(_mk_addr(a.get("streetAddress"), a.get("addressLocality"), a.get("addressRegion"), a.get("postalCode")))
+    return cands
 
+def _candidates_from_vcard_microdata(soup: BeautifulSoup) -> list[dict]:
+    cands = []
+    for block in soup.select(".adr, [itemtype*='PostalAddress'], [itemscope][itemtype*='schema.org/PostalAddress']"):
+        street_el = block.select_one(".street-address,[itemprop='streetAddress']")
+        city_el   = block.select_one(".locality,[itemprop='addressLocality']")
+        state_el  = block.select_one(".region,[itemprop='addressRegion']")
+        zip_el    = block.select_one(".postal-code,[itemprop='postalCode']")
+        street = street_el.get_text(strip=True) if street_el else None
+        city   = city_el.get_text(strip=True) if city_el else None
+        state  = state_el.get_text(strip=True) if state_el else None
+        zip_   = zip_el.get_text(strip=True) if zip_el else None
+        cands.append(_mk_addr(street, city, state, zip_))
+    return cands
 
-def _addr_from_html_tag(soup: BeautifulSoup):
-    tag = soup.find("address")
-    if tag:
-        return _addr_from_regex(tag.get_text(" ", strip=True))
+def _candidates_from_address_tags(soup: BeautifulSoup) -> list[dict]:
+    cands = []
+    for tag in soup.find_all("address"):
+        txt = tag.get_text(" ", strip=True)
+        try:
+            parsed, _ = usaddress.tag(txt)
+            cand = _mk_addr(
+                f"{parsed.get('AddressNumber','')} {parsed.get('StreetName','')} {parsed.get('StreetNamePostType','')}".strip(),
+                parsed.get("PlaceName"), parsed.get("StateName"), parsed.get("ZipCode"),
+            )
+            if _is_good(cand):
+                cands.append(cand)
+        except usaddress.RepeatedLabelError:
+            pass
+        for gd in _iter_address_matches(txt):
+            cands.append(_mk_addr(gd.get("street"), gd.get("city"), gd.get("state"), gd.get("zip")))
+    return cands
 
+def _candidates_from_visible_text(text: str) -> list[dict]:
+    cands = []
+    for gd in _iter_address_matches(text):
+        cands.append(_mk_addr(gd.get("street"), gd.get("city"), gd.get("state"), gd.get("zip")))
+    return cands
 
-def _addr_from_regex(text: str):
-    m = ADDRESS_RE.search(text)
-    if not m:
+def _candidates_from_map_links(soup: BeautifulSoup) -> list[dict]:
+    """Extract address from Google/Apple Maps links (q=...)."""
+    cands = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if "google.com/maps" in href or "maps.google.com" in href or "maps.apple.com" in href:
+            try:
+                q = urlparse(href).query
+                params = parse_qs(q)
+                raw = None
+                if "q" in params and params["q"]:
+                    raw = unquote_plus(params["q"][0])
+                elif "destination" in params and params["destination"]:
+                    raw = unquote_plus(params["destination"][0])
+                elif "daddr" in params and params["daddr"]:
+                    raw = unquote_plus(params["daddr"][0])
+                if not raw:
+                    continue
+                raw = re.sub(r"\s+", " ", raw).strip()
+                try:
+                    parsed, _ = usaddress.tag(raw)
+                    cand = _mk_addr(
+                        " ".join([parsed.get("AddressNumber",""), parsed.get("StreetName",""), parsed.get("StreetNamePostType","")]).strip(),
+                        parsed.get("PlaceName"), parsed.get("StateName"), parsed.get("ZipCode"),
+                    )
+                    if _is_good(cand):
+                        cands.append(cand)
+                except usaddress.RepeatedLabelError:
+                    for gd in _iter_address_matches(raw):
+                        cands.append(_mk_addr(gd.get("street"), gd.get("city"), gd.get("state"), gd.get("zip")))
+            except Exception:
+                continue
+    return cands
+
+def _candidates_from_line_windows(text: str, max_width: int = 3) -> list[dict]:
+    """Slide windows of up to 3 lines; run usaddress on joined text. Captures line-broken addresses."""
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    cands = []
+    n = len(lines)
+    for w in (2, 3):
+        if w > max_width: break
+        for i in range(n - w + 1):
+            chunk = " ".join(lines[i:i+w])
+            if not re.search(r"\b[A-Z]{2}\b\s+\d{5}", chunk) and not re.search(r"\b[A-Z]{2}\b", chunk):
+                continue
+            try:
+                parsed, _ = usaddress.tag(chunk)
+                cand = _mk_addr(
+                    " ".join([parsed.get("AddressNumber",""), parsed.get("StreetName",""), parsed.get("StreetNamePostType","")]).strip(),
+                    parsed.get("PlaceName"), parsed.get("StateName"), parsed.get("ZipCode"),
+                )
+                if _is_good(cand):
+                    cands.append(cand)
+            except usaddress.RepeatedLabelError:
+                pass
+    return cands
+
+def _score_candidate(c: dict, text: str, state_hint: str | None) -> float:
+    score = 0.0
+    if c.get("zip"): score += 2.0
+    if c.get("state"): score += 2.0
+    if c.get("city"): score += 1.0
+    if c.get("address"): score += 1.0
+    if state_hint and c.get("state") == state_hint:
+        score += 2.5
+    if c.get("address"):
+        addr = c["address"]
+        for m in ADDRESS_BLOCK_RE.finditer(text):
+            start = m.start()
+            window = text[max(0, start-300): start+800]
+            if addr.lower()[:10] in window.lower():
+                score += 2.0
+                break
+    if c.get("address") and "box" in c["address"].lower():
+        score -= 1.5
+    return score
+
+# Lazy-inited shared LLM for addresses
+_ADDRESS_LLM: ChatOpenAI | None = None
+
+def _address_llm() -> ChatOpenAI:
+    global _ADDRESS_LLM
+    if _ADDRESS_LLM is None:
+        _ADDRESS_LLM = ChatOpenAI(model="gpt-4o-mini", temperature=0.0, openai_api_key=os.getenv("OPENAI_API_KEY"))
+    return _ADDRESS_LLM
+
+async def _ai_choose_best_address(candidates: list[dict], page_text: str, state_hint: str | None) -> dict | None:
+    filtered = [c for c in candidates if c.get("city") and (not state_hint or not c.get("state") or c.get("state") == state_hint or len(c.get("state",""))==2)]
+    if not filtered:
         return None
-    try:
-        parsed, _ = usaddress.tag(m.group(0))
-    except usaddress.RepeatedLabelError:
-        return None
-    return {
-        "address": (f"{parsed.get('AddressNumber','')} {parsed.get('StreetName','')} "
-                    f"{parsed.get('StreetNamePostType','')}").strip(),
-        "city": parsed.get("PlaceName"),
-        "state": parsed.get("StateName"),
-        "zip": parsed.get("ZipCode"),
-    }
-
-
-def extract_address_fields(html: str) -> dict:
-    soup = BeautifulSoup(html, "html.parser")
-    return (
-        _addr_from_json_ld(soup)
-        or _addr_from_html_tag(soup)
-        or _addr_from_regex(visible_text(html))
-        or {}
+    seen = set(); uniq = []
+    for c in filtered:
+        key = (c.get("address"), c.get("city"), c.get("state"), c.get("zip"))
+        if key in seen: continue
+        uniq.append(c); seen.add(key)
+    uniq = uniq[:12]
+    prompt = (
+        "Select the single best PHYSICAL street address for the ministry on this page.\n"
+        "Rules:\n"
+        "- Prefer a full street address over a PO Box; use PO Box only if no street address.\n"
+        "- Prefer addresses near Contact/Visit/Location sections or footer.\n"
+        "- Prefer an address matching the state hint if present.\n"
+        "- Ignore unrelated venues or map platform addresses.\n"
+        "- Output JSON ONLY with keys: address, city, state, zip. State must be 2-letter if available.\n"
+        f"State hint: {state_hint or ''}\n"
+        f"\nCANDIDATES:\n{json.dumps(uniq, ensure_ascii=False)}\n"
+        f"\nPAGE TEXT (truncated):\n{page_text[:2500]}"
     )
+    try:
+        resp = await _address_llm().ainvoke([HumanMessage(content=prompt)])
+        data = json.loads((resp.content or "").strip())
+        if isinstance(data, dict):
+            out = _mk_addr(data.get("address"), data.get("city"), data.get("state"), data.get("zip"))
+            if _is_good(out):
+                return out
+    except Exception:
+        pass
+    return None
+
+async def _ai_extract_from_text(page_text: str, state_hint: str | None) -> dict | None:
+    prompt = (
+        "From the following text, extract the best PHYSICAL mailing address for the ministry/church.\n"
+        "Prefer street addresses; use PO Box only if no street address exists. Prefer matches to the state hint.\n"
+        "Output JSON ONLY with keys: address, city, state, zip. If zip is missing, you may omit it.\n"
+        f"State hint: {state_hint or ''}\n\nTEXT:\n{page_text[:4000]}"
+    )
+    try:
+        resp = await _address_llm().ainvoke([HumanMessage(content=prompt)])
+        data = json.loads((resp.content or "").strip())
+        if isinstance(data, dict):
+            out = _mk_addr(data.get("address"), data.get("city"), data.get("state"), data.get("zip"))
+            if _is_good(out):
+                return out
+    except Exception:
+        pass
+    return None
+
+async def extract_address_fields(html: str, page_text: str | None = None, state_hint: str | None = None) -> dict:
+    """
+    AI-boosted extractor with multiple harvesters + AI arbitration.
+    Returns {address, city, state, zip} (zip may be None) or {}.
+    """
+    if not html and not page_text:
+        return {}
+    soup = BeautifulSoup(html or "", "html.parser")
+    text = (page_text or visible_text(html or ""))[:16000]
+
+    candidates = []
+    candidates += _candidates_from_jsonld(soup)
+    candidates += _candidates_from_vcard_microdata(soup)
+    candidates += _candidates_from_address_tags(soup)
+    candidates += _candidates_from_map_links(soup)
+    candidates += _candidates_from_visible_text(text)
+    candidates += _candidates_from_line_windows(text)
+
+    # normalize & dedup
+    normed, seen = [], set()
+    for c in candidates:
+        n = _mk_addr(c.get("address"), c.get("city"), c.get("state"), c.get("zip"))
+        if not any(v for v in n.values()): 
+            continue
+        key = (n.get("address"), n.get("city"), n.get("state"), n.get("zip"))
+        if key in seen: 
+            continue
+        seen.add(key); normed.append(n)
+
+    if os.getenv("ADDR_DEBUG") == "1":
+        print("ADDR_CANDIDATES_LOCAL", normed[:8])
+
+    if not normed:
+        # last-ditch: direct AI from text
+        direct = await _ai_extract_from_text(text, state_hint)
+        return direct or {}
+
+    ranked = sorted(normed, key=lambda c: _score_candidate(c, text, state_hint), reverse=True)
+
+    # If clear winner by score, return it
+    def sc(i): return _score_candidate(ranked[i], text, state_hint)
+    if len(ranked) == 1 or sc(0) - sc(1) >= 1.5:
+        return ranked[0]
+
+    # Otherwise ask AI to pick the best
+    chosen = await _ai_choose_best_address(ranked[:12], text, state_hint)
+    if chosen:
+        return chosen
+    return ranked[0]
+
+# ---------- Search-based Address Enrichment (DDG + AI) -------------------------------------
+SEARCH_ADDR_QUERIES = [
+    "site:{domain} contact",
+    "site:{domain} visit",
+    "site:{domain} location",
+    "site:{domain} directions",
+    "site:{domain} find us",
+    '"{org}" address {state}',
+    '{org} address {state}',
+    '"{org}" address',
+]
+
+ADDR_AGGREGATORS = (
+    "google.com/maps", "maps.google.com", "maps.apple.com",
+    "bing.com/maps", "yelp.com", "mapquest.com",
+)
+
+CONTACT_SLUGS = [
+    "/contact", "/contact-us", "/contactus", "/visit", "/visit-us",
+    "/plan-a-visit", "/im-new", "/location", "/locations",
+    "/find-us", "/directions", "/about", "/about-us",
+]
+
+async def _ddg_candidate_urls(org_name: str, home_url: str, state_hint: str | None, max_urls: int = 8) -> list[str]:
+    base = f"{urlparse(home_url).scheme}://{urlparse(home_url).netloc}"
+    host = urlparse(home_url).netloc
+    domain = host
+    queries = [q.format(domain=domain, org=org_name, state=(state_hint or "")) for q in SEARCH_ADDR_QUERIES]
+
+    seen, out = set(), []
+
+    # Proactively try common contact slugs on the same domain
+    for slug in CONTACT_SLUGS:
+        u = urljoin(base, slug)
+        if u not in seen:
+            seen.add(u); out.append(u)
+
+    # DuckDuckGo search for on-site pages and map/dir pages
+    try:
+        with DDGS() as ddgs:
+            for q in queries:
+                for r in ddgs.text(q, max_results=5):
+                    u = r.get("href")
+                    if not u: continue
+                    netloc = urlparse(u).netloc
+                    if (netloc == host) or any(agg in u for agg in ADDR_AGGREGATORS):
+                        if u not in seen:
+                            seen.add(u); out.append(u)
+                    if len(out) >= max_urls:
+                        break
+                if len(out) >= max_urls:
+                    break
+    except Exception:
+        pass
+
+    return out[:max_urls]
+
+async def enrich_address_via_duckduckgo(org_name: str, home_url: str, state_hint: str | None) -> dict:
+    """
+    Returns {address, city, state, zip} or {}.
+    Strategy:
+      1) discover candidate pages via contact slugs + DDG
+      2) harvest address candidates (JSON-LD, <address>, map links, line windows)
+      3) rank heuristically; if ambiguous, ask AI to choose best
+    """
+    candidate_urls = await _ddg_candidate_urls(org_name, home_url, state_hint, max_urls=8)
+
+    # Collect candidates across pages
+    all_candidates: list[dict] = []
+    texts_for_ai: list[str] = []
+    for u in candidate_urls:
+        html = await fetch_html(u)
+        if not html:
+            continue
+        soup = BeautifulSoup(html, "html.parser")
+        text = visible_text(html)[:6000]
+        texts_for_ai.append(f"[{u}]\n{text[:3000]}")
+
+        all_candidates += _candidates_from_jsonld(soup)
+        all_candidates += _candidates_from_address_tags(soup)
+        all_candidates += _candidates_from_map_links(soup)
+        all_candidates += _candidates_from_visible_text(text)
+        all_candidates += _candidates_from_line_windows(text)
+
+    # Normalize + dedupe
+    normed, seen = [], set()
+    for c in all_candidates:
+        n = _mk_addr(c.get("address"), c.get("city"), c.get("state"), c.get("zip"))
+        if not any(v for v in n.values()): 
+            continue
+        key = (n.get("address"), n.get("city"), n.get("state"), n.get("zip"))
+        if key in seen: 
+            continue
+        seen.add(key); normed.append(n)
+
+    if os.getenv("ADDR_DEBUG") == "1":
+        print("ADDR_DDG_URLS", candidate_urls)
+        print("ADDR_DDG_CANDIDATES", normed[:8])
+
+    if not normed:
+        # last-ditch: direct AI over concatenated texts
+        joined = "\n\n".join(texts_for_ai)[:12000]
+        direct = await _ai_extract_from_text(joined, state_hint)
+        return direct or {}
+
+    joined_text = "\n\n".join(texts_for_ai)[:12000]
+    ranked = sorted(normed, key=lambda c: _score_candidate(c, joined_text, state_hint), reverse=True)
+
+    def sc(i): return _score_candidate(ranked[i], joined_text, state_hint)
+    if len(ranked) == 1 or sc(0) - sc(1) >= 1.5:
+        return ranked[0]
+
+    chosen = await _ai_choose_best_address(ranked[:12], joined_text, state_hint)
+    if chosen:
+        return chosen
+    return ranked[0]
+
 
 # ---------- Category classifier & summariser -------------------------------------------------
 class CategoryClassifier:
@@ -387,23 +751,6 @@ class Summariser:
         except Exception:
             return ""
 
-    async def page_type(self, text: str, url: str) -> str:
-        prompt = (
-            "Classify the webpage into one of: 'ministry', 'listing', 'career', "
-            "'donation', or 'other'. A ministry page describes a single "
-            "ministry or program. A listing page mainly links to multiple "
-            "ministries. Return only the label.\n"
-            f"URL: {url}\nText:\n" + (text or "")[:2000]
-        )
-        try:
-            resp = await self.llm.ainvoke([HumanMessage(content=prompt)])
-            label = (resp.content or "").strip().lower()
-            if label not in {"ministry", "listing", "career", "donation"}:
-                return "other"
-            return label
-        except Exception:
-            return "other"
-
     async def resolve_org_and_title(
         self,
         page_text: str,
@@ -478,30 +825,20 @@ async def search_ministries(county: str, state_abbrev: str, limit: int) -> list[
 class Browser:
     def __init__(self):
         self.ws_url = os.getenv("PLAYWRIGHT_MCP_URL")
-        self._toolkit: PlayWrightBrowserToolkit | None = None
-        self._playwright = None
-        self._browser = None
         self._task: asyncio.Task | None = asyncio.create_task(self._open())
+        self._toolkit: PlayWrightBrowserToolkit | None = None
 
     async def _open(self):
-        self._playwright = await async_playwright().start()
+        pw = await async_playwright().start()
         if self.ws_url:
-            self._browser = await self._playwright.chromium.connect(self.ws_url)
-        else:
-            self._browser = await self._playwright.chromium.launch(headless=True)
-        return self._browser
+            return await pw.chromium.connect(self.ws_url)
+        return await pw.chromium.launch(headless=True)
 
     async def toolkit(self) -> PlayWrightBrowserToolkit:
         if self._toolkit is None:
             browser = await self._task
             self._toolkit = PlayWrightBrowserToolkit.from_browser(async_browser=browser)
         return self._toolkit
-
-    async def close(self):
-        if self._browser:
-            await self._browser.close()
-        if self._playwright:
-            await self._playwright.stop()
 
 # ---------- Ministry extraction --------------------------------------------------------------
 MINISTRY_WORDS = ("ministry", "ministries", "program", "group", "recovery", "care", "support", "outreach")
@@ -564,10 +901,6 @@ class MinistryScraper:
             if not page_text.strip():
                 return []
 
-            page_kind = await self.summariser.page_type(page_text, url)
-            if page_kind in {"career", "donation", "other"}:
-                return []
-
             soup = BeautifulSoup(page_html or "", "html.parser")
             home_url = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
             host = (urlparse(url).hostname or "").lower()
@@ -608,21 +941,17 @@ class MinistryScraper:
                 else:
                     org_name = org_name_guess if org_name_guess and org_name_guess.lower() not in AGGREGATOR_NAMES else (page_title or result_title or org_name)
 
-            # Use AI to detect ministry listing pages and expand them
-            sublinks = extract_ministry_links(soup, url) if page_kind == "listing" else []
-            if page_kind == "listing" and not sublinks:
-                return []
+            # Detect index of ministries; explode to individual entries
+            sublinks = extract_ministry_links(soup, url)
+            is_index_like = ("/ministr" in (urlparse(url).path.lower())) or (len(sublinks) >= 3)
 
             records: list[MinistryRecord] = []
-            if page_kind == "listing" and sublinks:
+            if is_index_like and sublinks:
                 for link_title, link_url in sublinks[:30]:  # cap fan-out per page
                     html2 = await fetch_html(link_url)
                     if not html2:
                         continue
                     text2 = visible_text(html2)
-                    kind2 = await self.summariser.page_type(text2, link_url)
-                    if kind2 != "ministry":
-                        continue
                     soup2 = BeautifulSoup(html2, "html.parser")
 
                     # Page-specific guesses
@@ -656,12 +985,12 @@ class MinistryScraper:
                         fixed2 = _clean_name_from_titles(page_title2, link_title)
                         if fixed2:
                             org2 = fixed2
-                        else:
-                            org2 = org_name
 
                     summary2 = await self.summariser.summary(text2)
                     cats2 = await self.classifier.classify(summary2 or text2[:600])
-                    addr2 = extract_address_fields(html2)
+                    addr2 = await extract_address_fields(html2, text2, state_abbrev)
+                    if not (addr2.get("city") and addr2.get("state")):
+                        addr2 = await enrich_address_via_duckduckgo(org2, home_url, state_abbrev)
                     phone2 = PHONE_REGEX.search(text2)
                     email2 = EMAIL_REGEX.search(text2)
 
@@ -686,7 +1015,9 @@ class MinistryScraper:
             # Single-ministry page
             summary = await self.summariser.summary(page_text)
             cats = await self.classifier.classify(summary or page_text[:600])
-            addr = extract_address_fields(page_html or "")
+            addr = await extract_address_fields(page_html or "", page_text, state_abbrev)
+            if not (addr.get("city") and addr.get("state")):
+                addr = await enrich_address_via_duckduckgo(org_name, home_url, state_abbrev)
             phone = PHONE_REGEX.search(page_text)
             email = EMAIL_REGEX.search(page_text)
 
@@ -757,7 +1088,6 @@ class MinistryScraper:
                 self._write_record(rec)
 
     async def close(self):
-        await self.browser.close()
         if _async_session and not _async_session.closed:
             await _async_session.close()
 
