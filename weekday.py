@@ -339,6 +339,51 @@ POBOX_CITYZIP_RE = re.compile(r"""
 (?P<zip>\d{5}(?:-\d{4})?)
 """, re.I | re.X)
 
+STREET_LINE_RE = re.compile(STREET_PATTERN, re.I | re.X)
+
+
+def _canonicalize_addr(a: dict, state_hint: str | None = None) -> dict:
+    """Repair common splits (e.g., 'Blvd.Prattville' in city) by re-parsing a single joined line."""
+    if not a:
+        return {}
+    parts = [a.get("address") or "", a.get("city") or "", a.get("state") or state_hint or "", a.get("zip") or ""]
+    line = " ".join(str(x).strip() for x in parts if x).replace(" ,", ",")
+    m = STREET_CITYZIP_RE.search(line)
+    if m:
+        return {
+            "address": m.group("street").strip(),
+            "city": m.group("city").replace("(Mailing Address)", "").strip(),
+            "state": m.group("state").upper(),
+            "zip": m.group("zip"),
+        }
+    out = dict(a)
+    if out.get("city"):
+        out["city"] = out["city"].replace("(Mailing Address)", "").strip()
+    return out
+
+
+def _suspect_addr(a: dict) -> bool:
+    """True if the address looks missing or non-addressy; never raises."""
+    try:
+        s = (a or {}).get("address") or ""
+        if not s:
+            return True
+        s = str(s).strip()
+        return not (
+            STREET_CITYZIP_RE.search(s) or
+            STREET_LINE_RE.search(s) or
+            POBOX_CITYZIP_RE.search(s)
+        )
+    except Exception:
+        return True
+
+
+def _state_ok(c: dict, state_hint: str | None) -> bool:
+    if not state_hint:
+        return True
+    st = (c.get("state") or "").upper()
+    return st == state_hint.upper()
+
 def _iter_address_matches(text: str):
     for m in STREET_CITYZIP_RE.finditer(text):
         yield m.groupdict()
@@ -481,6 +526,67 @@ def _candidates_from_line_windows(text: str, max_width: int = 3) -> list[dict]:
                 pass
     return cands
 
+def _candidates_from_map_iframes(soup: BeautifulSoup) -> list[dict]:
+    cands: list[dict] = []
+    for iframe in soup.find_all("iframe", src=True):
+        src = iframe.get("src") or ""
+        if "google.com/maps" not in src and "maps.google.com" not in src:
+            continue
+        try:
+            u = urlparse(src)
+            qs = parse_qs(u.query)
+            raw = ""
+            if qs.get("q"):
+                raw = unquote_plus(qs["q"][0])
+            elif qs.get("destination"):
+                raw = unquote_plus(qs["destination"][0])
+            elif qs.get("daddr"):
+                raw = unquote_plus(qs["daddr"][0])
+            if not raw and "pb=" in src:
+                # Attempt to peel out !2s<Name and Address> from the embed payload
+                payload = unquote_plus(src.split("pb=", 1)[1])
+                m = re.search(r"!2s([^!]+)", payload)
+                if m:
+                    raw = unquote_plus(m.group(1))
+            raw = (raw or "").strip()
+            if not raw:
+                continue
+            # Try to parse into street/city/state/zip using your existing machinery
+            cand = None
+            if usaddress:
+                try:
+                    parsed, _ = usaddress.tag(raw)
+                    cand = {
+                        "address": " ".join([
+                            parsed.get("AddressNumber", ""),
+                            parsed.get("StreetNamePreType", ""),
+                            parsed.get("StreetName", ""),
+                            parsed.get("StreetNamePostType", ""),
+                        ]).strip(),
+                        "city": parsed.get("PlaceName"),
+                        "state": parsed.get("StateName"),
+                        "zip": parsed.get("ZipCode"),
+                    }
+                except usaddress.RepeatedLabelError:
+                    pass
+            if not cand:
+                # Fallback: try regex chunking
+                m = STREET_CITYZIP_RE.search(raw)
+                if m:
+                    cand = {
+                        "address": m.group("street"),
+                        "city": m.group("city"),
+                        "state": m.group("state"),
+                        "zip": m.group("zip"),
+                    }
+            if cand:
+                cand = _canonicalize_addr(cand)
+                if not _suspect_addr(cand):
+                    cands.append(cand)
+        except Exception:
+            continue
+    return cands
+
 def _score_candidate(c: dict, text: str, state_hint: str | None) -> float:
     score = 0.0
     if c.get("zip"): score += 2.0
@@ -578,6 +684,7 @@ async def extract_address_fields(html: str, page_text: str | None = None, state_
     candidates += _candidates_from_map_links(soup)
     candidates += _candidates_from_visible_text(text)
     candidates += _candidates_from_line_windows(text)
+    candidates += _candidates_from_map_iframes(soup)
 
     # normalize & dedup
     normed, seen = [], set()
@@ -694,6 +801,7 @@ async def enrich_address_via_duckduckgo(org_name: str, home_url: str, state_hint
         all_candidates += _candidates_from_map_links(soup)
         all_candidates += _candidates_from_visible_text(text)
         all_candidates += _candidates_from_line_windows(text)
+        candidates += _candidates_from_map_iframes(soup)
 
     # Normalize + dedupe
     normed, seen = [], set()
@@ -1030,18 +1138,6 @@ async def agentic_address_search(url: str, state_hint: str | None, browser: Brow
         pass
     return {}
 
-
-async def _resolve_address(methods: list[tuple[str, Callable[[], Awaitable[dict]]]]) -> dict:
-    """Run address lookup methods in order, logging which one succeeds."""
-    last: dict = {}
-    for name, fn in methods:
-        last = await fn()
-        if last.get("city") and last.get("state"):
-            print(f"[address] using {name}")
-            return last
-    print("[address] all address methods failed")
-    return last
-
 # ---------- Ministry extraction --------------------------------------------------------------
 MINISTRY_WORDS = ("ministry", "ministries", "program", "group", "recovery", "care", "support", "outreach")
 
@@ -1191,12 +1287,13 @@ class MinistryScraper:
 
                     summary2 = await self.summariser.summary(text2)
                     cats2 = await self.classifier.classify(summary2 or text2[:600])
-                    addr2 = await _resolve_address([
-                        ("agentic_address_search", lambda: agentic_address_search(link_url, state_abbrev, self.browser)),
-                        ("search_google_maps_address", lambda: search_google_maps_address(org2, county, state_abbrev)),
-                        ("extract_address_fields", lambda: extract_address_fields(html2, text2, state_abbrev)),
-                        ("enrich_address_via_duckduckgo", lambda: enrich_address_via_duckduckgo(org2, home_url, state_abbrev)),
-                    ])
+                    addr2 = await agentic_address_search(link_url, state_abbrev, self.browser)
+                    if not (addr2.get("city") and addr2.get("state")):
+                        addr2 = await search_google_maps_address(org2, county, state_abbrev)
+                    if not (addr2.get("city") and addr2.get("state")):
+                        addr2 = await extract_address_fields(html2, text2, state_abbrev)
+                    if not (addr2.get("city") and addr2.get("state")):
+                        addr2 = await enrich_address_via_duckduckgo(org2, home_url, state_abbrev)
 
                     phone2 = PHONE_REGEX.search(text2)
                     email2 = EMAIL_REGEX.search(text2)
@@ -1222,12 +1319,13 @@ class MinistryScraper:
             # Single-ministry page
             summary = await self.summariser.summary(page_text)
             cats = await self.classifier.classify(summary or page_text[:600])
-            addr = await _resolve_address([
-                ("agentic_address_search", lambda: agentic_address_search(url, state_abbrev, self.browser)),
-                ("search_google_maps_address", lambda: search_google_maps_address(org_name, county, state_abbrev)),
-                ("extract_address_fields", lambda: extract_address_fields(page_html or "", page_text, state_abbrev)),
-                ("enrich_address_via_duckduckgo", lambda: enrich_address_via_duckduckgo(org_name, home_url, state_abbrev)),
-            ])
+            addr = await agentic_address_search(url, state_abbrev, self.browser)
+            if not (addr.get("city") and addr.get("state")):
+                addr = await search_google_maps_address(org_name, county, state_abbrev)
+            if not (addr.get("city") and addr.get("state")):
+                addr = await extract_address_fields(page_html or "", page_text, state_abbrev)
+            if not (addr.get("city") and addr.get("state")):
+                addr = await enrich_address_via_duckduckgo(org_name, home_url, state_abbrev)
             phone = PHONE_REGEX.search(page_text)
             email = EMAIL_REGEX.search(page_text)
 
