@@ -23,7 +23,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import AsyncIterator
+from typing import AsyncIterator, Callable, Awaitable
 from urllib.parse import urljoin, urlparse, parse_qs, unquote_plus
 
 import aiohttp
@@ -1030,6 +1030,18 @@ async def agentic_address_search(url: str, state_hint: str | None, browser: Brow
         pass
     return {}
 
+
+async def _resolve_address(methods: list[tuple[str, Callable[[], Awaitable[dict]]]]) -> dict:
+    """Run address lookup methods in order, logging which one succeeds."""
+    last: dict = {}
+    for name, fn in methods:
+        last = await fn()
+        if last.get("city") and last.get("state"):
+            print(f"[address] using {name}")
+            return last
+    print("[address] all address methods failed")
+    return last
+
 # ---------- Ministry extraction --------------------------------------------------------------
 MINISTRY_WORDS = ("ministry", "ministries", "program", "group", "recovery", "care", "support", "outreach")
 
@@ -1179,13 +1191,12 @@ class MinistryScraper:
 
                     summary2 = await self.summariser.summary(text2)
                     cats2 = await self.classifier.classify(summary2 or text2[:600])
-                    addr2 = await agentic_address_search(link_url, state_abbrev, self.browser)
-                    if not (addr2.get("city") and addr2.get("state")):
-                        addr2 = await search_google_maps_address(org2, county, state_abbrev)
-                    if not (addr2.get("city") and addr2.get("state")):
-                        addr2 = await extract_address_fields(html2, text2, state_abbrev)
-                    if not (addr2.get("city") and addr2.get("state")):
-                        addr2 = await enrich_address_via_duckduckgo(org2, home_url, state_abbrev)
+                    addr2 = await _resolve_address([
+                        ("agentic_address_search", lambda: agentic_address_search(link_url, state_abbrev, self.browser)),
+                        ("search_google_maps_address", lambda: search_google_maps_address(org2, county, state_abbrev)),
+                        ("extract_address_fields", lambda: extract_address_fields(html2, text2, state_abbrev)),
+                        ("enrich_address_via_duckduckgo", lambda: enrich_address_via_duckduckgo(org2, home_url, state_abbrev)),
+                    ])
 
                     phone2 = PHONE_REGEX.search(text2)
                     email2 = EMAIL_REGEX.search(text2)
@@ -1211,13 +1222,12 @@ class MinistryScraper:
             # Single-ministry page
             summary = await self.summariser.summary(page_text)
             cats = await self.classifier.classify(summary or page_text[:600])
-            addr = await agentic_address_search(url, state_abbrev, self.browser)
-            if not (addr.get("city") and addr.get("state")):
-                addr = await search_google_maps_address(org_name, county, state_abbrev)
-            if not (addr.get("city") and addr.get("state")):
-                addr = await extract_address_fields(page_html or "", page_text, state_abbrev)
-            if not (addr.get("city") and addr.get("state")):
-                addr = await enrich_address_via_duckduckgo(org_name, home_url, state_abbrev)
+            addr = await _resolve_address([
+                ("agentic_address_search", lambda: agentic_address_search(url, state_abbrev, self.browser)),
+                ("search_google_maps_address", lambda: search_google_maps_address(org_name, county, state_abbrev)),
+                ("extract_address_fields", lambda: extract_address_fields(page_html or "", page_text, state_abbrev)),
+                ("enrich_address_via_duckduckgo", lambda: enrich_address_via_duckduckgo(org_name, home_url, state_abbrev)),
+            ])
             phone = PHONE_REGEX.search(page_text)
             email = EMAIL_REGEX.search(page_text)
 
